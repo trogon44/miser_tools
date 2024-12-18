@@ -123,7 +123,12 @@ class BaseSeqs:
         # iterate over all alignments in the alignment set
         for alignment in alignment_set:
             # skip if the alignment isn't mapped to the vector or the mapping quality falls below map_qual_cutoff
-            if (not alignment.is_mapped) or (alignment.mapping_quality < map_qual_cutoff):
+            try:
+                unmapped = not alignment.is_mapped
+            except:
+                unmapped = alignment.is_unmapped
+
+            if (unmapped) or (alignment.mapping_quality < map_qual_cutoff) or (alignment.is_secondary):
                 continue
             
             # set name to the query name for the alignment (note that this might not be unique for alignment)
@@ -152,7 +157,7 @@ class BaseSeqs:
 
         self.pairwise_dict = pairwise_dict
 
-    def find_barcodes(self):
+    def find_barcodes(self, nanopore_diagnost = False):
         """"
 
         Get the barcodes from fastq of reads.
@@ -213,15 +218,21 @@ class BaseSeqs:
             else:
                 label = 'missing'
                 bc = np.nan
-        
-            read_des = fastq_entry.description
-            read_ch_match = re.search(r'read=(\d+).*ch=(\d+)', read_des)
-            
-            barcode_dict[read_name] = {'barcode':bc, 
-                                    'label':label, 
-                                    'channel': int(read_ch_match.group(2)),
-                                    'read': int(read_ch_match.group(1)),
-                                    'reverse': self.pairwise_dict[read_name][0]['reverse']}    
+
+            if nanopore_diagnost:
+                read_des = fastq_entry.description
+                read_ch_match = re.search(r'read=(\d+).*ch=(\d+)', read_des)
+                
+                barcode_dict[read_name] = {'barcode':bc, 
+                                        'label':label, 
+                                        'channel': int(read_ch_match.group(2)),
+                                        'read': int(read_ch_match.group(1)),
+                                        'reverse': self.pairwise_dict[read_name][0]['reverse']}
+            else:
+                barcode_dict[read_name] = {'barcode':bc, 
+                                        'label':label, 
+                                        'reverse': self.pairwise_dict[read_name][0]['reverse']}
+
         self.barcodes = pd.DataFrame.from_dict(barcode_dict, orient='index')
 
     def estimate_library_size(self, use_preseq = False):
