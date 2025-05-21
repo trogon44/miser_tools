@@ -2,13 +2,31 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 from pathlib import Path
-from Bio import SeqIO, SeqRecord
+from Bio import SeqIO, SeqRecord, AlignIO
 import pysam
 import os
 import seaborn as sns
 from tqdm import tqdm
 import re
 from Levenshtein import distance as levenshtein_distance
+import subprocess
+
+def run_sys_command(command):
+    print(f'Running command: {command}')
+    result = subprocess.run(
+        command, 
+        shell=True, 
+        stdout=subprocess.DEVNULL,  # Suppress stdout
+        stderr=subprocess.PIPE      # Capture stderr, if needed
+    )
+    
+    # Check the return code for success or failure
+    if result.returncode == 0:
+        print("Command executed successfully.")
+    else:
+        print("Command failed. Error:", result.stderr.decode())
+    return
+
 
 class BaseSeqs:
     # initial BaseSeqs class with reference fasta, fastq files of reads, and the start and stop indices of Cas protein
@@ -723,6 +741,169 @@ class AmpliconSeqs(BaseSeqs):
 
         """
         super().align2ref(full_plasmid=False)
+
+class DeletionVarCount:
+    """"
+
+    Class for counting the number of deletion variants in a fastq file
+
+    For initialization:
+    dvc = sequtils.DeletionVarCount(ref_fasta, reads_fastq)
+
+    Parameters
+    -----------------------------------------------------
+    ref_fasta: string with name of full-length reference vector fasta
+    reads_fastq: string with fastq file of nanopore reads
+
+    Functions
+    -----------------------------------------------------
+    dvc.build_deletion_matrix(): build a deletion matrix from the reference fasta
+
+    """
+    def __init__(self, ref_fasta, reads_fastq):
+        self.ref_fasta = Path(ref_fasta)
+        self.reads_fastq = Path(reads_fastq)
+        self.fastq_index = SeqIO.index(str(self.reads_fastq), 'fastq')
+        self.read_count = len(list(self.fastq_index.keys()))
+        
+        print(f'Indexing fastq: "{str(self.reads_fastq)}"')
+        print(f'Fastq contains {self.read_count} reads.')
+
+        
+
+
+    def build_deletion_matrix(self, viewplot=True):
+        """"
+        Build a deletion matrix from the reference fasta.
+
+        Usage:
+        lvc.build_deletion_matrix()
+
+        """
+        self.ref_fasta_sort = self.ref_fasta.with_name(f"{self.ref_fasta.stem}_sorted{self.ref_fasta.suffix}")
+        self.wt_fasta = self.ref_fasta.with_name("wt_amplicon.fasta")
+
+        # create a size-sorted fasta of variants
+        var_lengths = []
+        var_names = []
+        for var_seq in SeqIO.parse(str(self.ref_fasta), 'fasta'):
+            var_names.append(var_seq.id)
+            var_lengths.append(len(var_seq.seq))
+        self.var_name_sort = [var_names[i] for i in np.argsort(var_lengths)[::-1]]
+        var_seqs_idx = SeqIO.index(str(self.ref_fasta), 'fasta')
+        # Write sorted fasta (biggest to smallest)
+        print(f"Writing sorted fasta of variants to {self.ref_fasta_sort}")
+        SeqIO.write([var_seqs_idx[vs] for vs in self.var_name_sort], self.ref_fasta_sort, 'fasta')
+        # Write wt-only fasta for minimap2 alignment.
+        wtseq = var_seqs_idx[self.var_name_sort[0]]
+        self.wt_length = len(wtseq.seq)
+        print(f"Writing wt-only fasta to {self.wt_fasta} with length {self.wt_length}")
+        SeqIO.write(wtseq, self.wt_fasta, 'fasta')
+
+        #create alignment of variants.
+        self.var_fasta_align = self.ref_fasta_sort.with_name(f"{self.ref_fasta_sort.stem}_aligned{self.ref_fasta_sort.suffix}")
+        mafft_call = f"mafft {self.ref_fasta_sort} > {self.var_fasta_align}"
+        print(f"Running mafft to create an MSA of deletion variants.")
+        run_sys_command(mafft_call)
+
+        # build deletion matrix
+        var_alignment = AlignIO.read(self.var_fasta_align, 'fasta')
+        del_mat = []
+        for var_al in var_alignment:
+            del_mat.append([ -1 if s == '-' else 1 for s in var_al.seq ])
+        self.del_mat = np.array(del_mat)
+
+        if viewplot:
+            plt.figure(figsize=(12, 4))  # Adjust figure size
+
+            # Force aspect ratio while preventing interpolation
+            plt.imshow(del_mat, cmap='gray', aspect=(self.del_mat.shape[1]/self.del_mat.shape[0])*(1/3), interpolation='nearest')
+
+            plt.title("Stacked deletion variants")
+            plt.xlabel("position")
+            plt.ylabel("variant")
+
+            plt.show()
+        return
+    
+    def assign_deletion_variants(self, threshold=0.90):
+                                         
+        """
+        Assign deletion variants to the fastq reads.
+
+        Usage:
+        dvc.assign_deletion_variants()
+
+        """
+
+        # check that the deletion matrix has been built
+        if not hasattr(self, 'del_mat'):
+            print("Running build_deletion_matrix...")
+            self.build_deletion_matrix(viewplot=False)
+
+        print("Running minimap2 to align fastq reads to WT fasta.")
+        # run minimap2 against only wt
+        wt_align = self.wt_fasta.with_name("wt_align.sam")
+        minimap2_call = f'minimap2 -ax map-ont {self.wt_fasta} {self.reads_fastq} > {wt_align}'
+        run_sys_command(minimap2_call)
+
+        print("Assigning deletion variants by scoring with the deletion matrix.")
+        # initialize dictionary for variant assignments of reads
+        read_assignment = {}
+        # open minimap2 alignment and iterate over entries
+        with pysam.AlignmentFile(wt_align, "r") as alignments:
+            for alignment in alignments:
+                # if an alignment is unmapped or not primary, move on
+                if alignment.is_unmapped or alignment.is_secondary or alignment.is_supplementary:
+                    continue
+
+                # get the pairwise alignment vectors for the read
+                pairwise = np.array(alignment.get_aligned_pairs())
+                # only take the indices over which the reference is mapped
+                valid_inds = np.where(pairwise[:,1] != None)[0]
+                # create a vector that represents the query over valid indices as 1's for matches and -1's for deletions
+                pairwise_match = [ -1 if p == None else 1 for p in pairwise[valid_inds,0]]
+                # get the valid reference indices
+                good_ref_inds = pairwise[valid_inds,1].astype(int)
+                # initialize a deletion vector as all deletion
+                del_vect = -1*np.ones(self.wt_length).astype(int)
+                # fill it in for the mapped query overlap
+                del_vect[good_ref_inds] = pairwise_match
+                # compute an overalap score by matrix multiplication with the matrix of variant deletion fingerprints
+                # the highest possible score is the length of the WT variant. (note that this highest score is possible
+                # for any of the variants).
+                overlap_score = np.matmul(self.del_mat, del_vect)
+                # find the index of the highest score
+                maxind = np.argmax(overlap_score)
+                # get the value of the highest score
+                maxval = overlap_score[maxind]
+                # if the value of the highest is threshold or more of the maximum possible score, count it as a positive identification
+                if maxval > threshold*self.wt_length:
+                    read_assignment[alignment.query_name] = {'length': alignment.infer_read_length(),
+                                                            'q-score': np.mean(alignment.query_qualities),
+                                                            'assignment': self.var_name_sort[maxind]}
+                
+        self.df_assignments = pd.DataFrame.from_dict(read_assignment, orient='index')
+
+
+        # count up the number of reads assigned to each variant
+        var_counts_dict = {}
+        for vns in self.var_name_sort:
+            var_counts_dict[vns] = {'var_count': (self.df_assignments['assignment'] == vns).sum()}
+        self.df_counts = pd.DataFrame.from_dict(var_counts_dict, orient='index')
+
+        print("Assignments complete.")
+        print(f"Found assignments for {len(self.df_assignments)}/{self.read_count} reads, {100*len(self.df_assignments)/self.read_count:.1f}%")
+        print(f"Cleaning up temporary files: {wt_align}, {self.ref_fasta_sort}, {self.var_fasta_align}")
+        os.remove(wt_align)
+        os.remove(self.ref_fasta_sort)
+        os.remove(self.var_fasta_align)
+        print("")
+        print("Finished.")
+
+        return self.df_counts
+    
+
 
 
 
