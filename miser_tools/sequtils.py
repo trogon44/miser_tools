@@ -11,6 +11,7 @@ import re
 from Levenshtein import distance as levenshtein_distance
 import subprocess
 
+
 def run_sys_command(command):
     print(f'Running command: {command}')
     result = subprocess.run(
@@ -758,6 +759,7 @@ class DeletionVarCount:
     Functions
     -----------------------------------------------------
     dvc.build_deletion_matrix(): build a deletion matrix from the reference fasta
+    dvc.assign_deletion_variants(): assign deletion variants to the fastq reads
 
     """
     def __init__(self, ref_fasta, reads_fastq):
@@ -777,7 +779,13 @@ class DeletionVarCount:
         Build a deletion matrix from the reference fasta.
 
         Usage:
-        lvc.build_deletion_matrix()
+        lvc.build_deletion_matrix(viewplot=True)
+
+        Parameters:
+        viewplot: boolean, whether to show a plot of the deletion matrix. Default is True.
+
+        Returns:
+        None
 
         """
         self.ref_fasta_sort = self.ref_fasta.with_name(f"{self.ref_fasta.stem}_sorted{self.ref_fasta.suffix}")
@@ -832,8 +840,17 @@ class DeletionVarCount:
         Assign deletion variants to the fastq reads.
 
         Usage:
-        dvc.assign_deletion_variants()
+        dvc.assign_deletion_variants(threshold=0.90)
 
+        Description:
+        This function assigns stacked deletion variants to the fastq reads using the deletion matrix
+        representation of the variants. It uses minimap2 to align the fastq reads to the WT reference.
+
+        Parameters:
+        threshold: float, the minimum fraction of the maximum possible score to assign a variant. Default is 0.90.
+        
+        Returns:
+        df_counts: pandas dataframe with the counts of each variant in the fastq reads.
         """
 
         # check that the deletion matrix has been built
